@@ -13,6 +13,7 @@ linux_user_ss.add(files(
   'fd-trans.c',
   'linuxload.c',
   'main.c',
+  'mega_sjlj.c',
   'mmap.c',
   'signal.c',
   'strace.c',
@@ -23,6 +24,15 @@ linux_user_ss.add(files(
 ))
 linux_user_ss.add(rt)
 linux_user_ss.add(libdw)
+
+if get_option('tcg_fuzzing')
+  resource_dir = run_command(
+    cc.cmd_array() + ['--print-resource-dir'],
+    check: true
+  ).stdout().strip()
+  libfuzzer = declare_dependency(link_args: [resource_dir + '/lib/s390x-redhat-linux-gnu/libclang_rt.fuzzer_no_main.a', '-lstdc++'])
+  linux_user_ss.add(libfuzzer)
+endif
 
 linux_user_ss.add(when: 'TARGET_HAS_BFLT', if_true: files('flatload.c'))
 linux_user_ss.add(when: 'TARGET_I386', if_true: files('vm86.c'))

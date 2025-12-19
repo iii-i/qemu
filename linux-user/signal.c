@@ -666,6 +666,14 @@ void signal_init(const char *rtsig_map)
 
     sigfillset(&act.sa_mask);
     act.sa_flags = SA_SIGINFO;
+#ifdef CONFIG_TCG_FUZZING
+    /*
+     * Use SA_ONSTACK in order to handle crashes caused by fuzzing.
+     * In these cases %r15 may contain garbage.
+     * Currently sigaltstack() is called by the sanitizer runtime.
+     */
+    act.sa_flags |= SA_ONSTACK;
+#endif
     act.sa_sigaction = host_signal_handler;
 
     /*
@@ -1034,6 +1042,10 @@ static uintptr_t host_sigbus_handler(CPUState *cpu, siginfo_t *info,
     return pc;
 }
 
+#ifdef CONFIG_TCG_FUZZING
+extern void return_to_fuzzer(int host_sig, void *puc);
+#endif
+
 static void host_signal_handler(int host_sig, siginfo_t *info, void *puc)
 {
     CPUState *cpu = thread_cpu;
@@ -1071,6 +1083,9 @@ static void host_signal_handler(int host_sig, siginfo_t *info, void *puc)
         case SIGILL:
         case SIGFPE:
         case SIGTRAP:
+#ifdef CONFIG_TCG_FUZZING
+            return_to_fuzzer(host_sig, puc);
+#endif
             die_from_signal(info);
         }
     }
@@ -1256,6 +1271,8 @@ int do_sigaction(int sig, const struct target_sigaction *act,
     return ret;
 }
 
+extern int fuzzer_tcg_sig;
+
 static void handle_pending_signal(CPUArchState *cpu_env, int sig,
                                   struct emulated_sigtable *k)
 {
@@ -1303,6 +1320,11 @@ static void handle_pending_signal(CPUArchState *cpu_env, int sig,
                    sig != TARGET_SIGURG &&
                    sig != TARGET_SIGWINCH &&
                    sig != TARGET_SIGCONT) {
+#ifdef CONFIG_TCG_FUZZING
+            fuzzer_tcg_sig = target_to_host_signal(sig);
+            cpu->exception_index = EXCP_RETURN;
+#endif
+            return;
             dump_core_and_abort(cpu_env, sig);
         }
     } else if (handler == TARGET_SIG_IGN) {
