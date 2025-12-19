@@ -57,6 +57,8 @@
 #include "user-mmap.h"
 #include "tcg/perf.h"
 #include "exec/page-vary.h"
+#include "mega_sjlj.h"
+#include <asm/ucontext.h>
 
 #ifdef CONFIG_SEMIHOSTING
 #include "semihosting/semihost.h"
@@ -679,6 +681,289 @@ static int parse_args(int argc, char **argv)
     return optind;
 }
 
+#ifdef CONFIG_TCG_FUZZING
+
+/*
+
+./configure \
+    --target-list=s390x-linux-user \
+    --cc=clang \
+    --extra-cflags="-fsanitize=fuzzer-no-link -march=z13 -O0 -g" \
+    --extra-ldflags=-fsanitize=fuzzer-no-link \
+    --disable-docs \
+    --enable-tcg-fuzzing
+
+$ mkdir corpus
+$ CRASH=corpus build/qemu-s390x /bin/true
+$ CRASH=crash-4eacc8d1ac31cd198d0bb3bdf514dff0230f0acb build/qemu-s390x /bin/true
+
+*/
+
+struct plan {
+    uint64_t regs[16];
+    uint64_t vregs[32][2];
+    uint32_t aregs[16];
+    uint32_t fpc;
+    uint64_t pswm;
+    uint64_t pswa;
+    uint16_t code;
+    unsigned insn : 1;
+};
+
+static struct mega_jmp_buf fuzzer_frame;
+static struct ucontext_extended fuzzer_native_uc;
+static int fuzzer_native_sig;
+int fuzzer_tcg_sig;
+
+void return_to_fuzzer(int host_sig, void *puc);
+void return_to_fuzzer(int host_sig, void *puc)
+{
+    fuzzer_native_sig = host_sig;
+    fuzzer_native_uc = *(struct ucontext_extended *)puc;
+    mega_longjmp(&fuzzer_frame);
+}
+
+#define PSW_MASK_USER 0x0000FF0180000000ULL
+
+static unsigned long fixup_pswm(unsigned long pswm)
+{
+    /*
+     * restore_sigregs() sets only bits covered by PSW_MASK_USER, so don't
+     * bother setting anything else.
+     *
+     * Force primary-space mode.
+     *
+     * restore_sigregs() allows PSW_MASK_RI only for RI tasks.
+     *
+     * Force userspace bits: DAT, interrupts, problem state, 64-bit.
+     */
+    return (pswm & PSW_MASK_USER & ~PSW_MASK_ASC & ~PSW_MASK_RI) |
+           PSW_MASK_DAT |
+           PSW_MASK_IO |
+           PSW_MASK_EXT |
+           PSW_MASK_MCHECK |
+           PSW_MASK_PSTATE |
+           PSW_MASK_64 |
+           PSW_MASK_32;
+}
+
+static unsigned long fixup_pswa(unsigned long pswa)
+{
+    /*
+     * Checking odd PSW address behavior is a waste of time.
+     */
+    pswa &= pswa & ~(unsigned long)1;
+
+    /*
+     * ASAN does not support arbitrary ranges.
+     * See llvm-project/compiler-rt/lib/asan/asan_mapping.h
+     */
+#ifdef QEMU_SANITIZE_ADDRESS
+    pswa &= 0xfffffffffffff;
+#endif
+
+    /*
+     * Do not run afoul of mmap_min_addr and some related SELinux stuff.
+     */
+    if (pswa < 0x10000) {
+        pswa |= 0x10000;
+    }
+
+    return pswa;
+}
+
+static unsigned int fixup_fpc(unsigned int fpc)
+{
+    /*
+     * fpu_lfpc_safe() will zero out FPC unless the reserved bits are cleared.
+     */
+    fpc &= 0xFCFCFF77;
+
+    /*
+     * fpu_lfpc_safe() will zero out FPC if it contains a reserved BRM value.
+     */
+    switch (fpc & 7) {
+    case 4:
+    case 5:
+    case 6:
+        fpc &= ~7;
+        break;
+    }
+
+    return fpc;
+}
+
+#define CODE_SIZE 6
+
+static void gen_code(uint16_t *buf, const struct plan *p)
+{
+    buf[0] = p->insn ? 0xb353 : 0xb35b;  /* diebr or didbr */
+    buf[1] = p->code;
+    buf[2] = 0x0001;  /* breakpoint */
+}
+
+struct run_natively_args {
+    const struct plan *p;
+    uint32_t *aregs;
+};
+
+static void run_natively(void *arg)
+{
+    struct run_natively_args *args = arg;
+    const struct plan *p = args->p;
+    uint32_t *aregs = args->aregs;
+    struct mega_jmp_buf code_env;
+
+    mega_set_state(&code_env,
+                   fixup_pswm(p->pswm), fixup_pswa(p->pswa),
+                   p->regs, aregs,
+                   fixup_fpc(p->fpc), p->vregs);
+    mega_longjmp(&code_env);
+}
+
+void helper_sfpc(CPUS390XState *env, uint64_t fpc);
+
+static void replicate(void *dst, size_t dst_size, const void *src, size_t src_size)
+{
+    if (src_size == 0) {
+        memset(dst, 0, dst_size);
+        return;
+    }
+    while (dst_size) {
+        size_t size = MIN(dst_size, src_size);
+        memcpy(dst, src, size);
+        dst += size;
+        dst_size -= size;
+    }
+}
+
+static int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
+{
+    abi_ulong code_mapping, code_mapping_end;
+    CPUArchState *env = cpu_env(first_cpu);
+    struct run_natively_args args;
+    uint32_t aregs[16];
+    struct plan p;
+
+    replicate(&p, sizeof(p), data, size);
+
+    /*
+     * Messed up aregs confuse GDB / libthread_db:
+     *
+     * thread_get_info_callback: cannot get thread info: generic error
+     */
+    memcpy(aregs, p.aregs, sizeof(aregs));
+    aregs[0] = (unsigned long)__builtin_thread_pointer() >> 32;
+    aregs[1] = (unsigned long)__builtin_thread_pointer();
+
+    memcpy(env->regs, p.regs, sizeof(env->regs));
+    memcpy(env->vregs, p.vregs, sizeof(env->vregs));
+    memcpy(env->aregs, aregs, sizeof(env->aregs));
+    helper_sfpc(env, fixup_fpc(p.fpc));
+    env->psw.mask = fixup_pswm(p.pswm);
+    env->cc_op = (env->psw.mask >> 44) & 3;
+    env->psw.addr = fixup_pswa(p.pswa);
+
+    code_mapping = env->psw.addr & ~(abi_ulong)0xfff;
+    code_mapping_end = (env->psw.addr + CODE_SIZE + 0xfff) & ~(abi_ulong)0xfff;
+
+    if (code_mapping != target_mmap(code_mapping, code_mapping_end - code_mapping, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0)) {
+        return -1;
+    }
+    gen_code((uint16_t *)fixup_pswa(p.pswa), &p);
+    fuzzer_tcg_sig = -1;
+    cpu_loop(env);
+    target_munmap(code_mapping, code_mapping_end - code_mapping);
+
+    if ((void *)code_mapping != mmap((void *)code_mapping, code_mapping_end - code_mapping, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0)) {
+        return -1;
+    }
+    gen_code((uint16_t *)fixup_pswa(p.pswa), &p);
+    args.p = &p;
+    args.aregs = aregs;
+    fuzzer_native_sig = -1;
+    mega_setjmp(&fuzzer_frame, run_natively, &args);
+    munmap((void *)code_mapping, code_mapping_end - code_mapping);
+
+    bool fail = false;
+    for (int i = 0; i < 16; i++) {
+        if (env->regs[i] != fuzzer_native_uc.uc_mcontext.regs.gprs[i]) {
+            printf("tcg r%d 0x%lx != native r%d 0x%lx\n", i, env->regs[i], i, fuzzer_native_uc.uc_mcontext.regs.gprs[i]);
+            fail = true;
+        }
+    }
+    for (int i = 0; i < 16; i++) {
+        uint64_t tmp;
+        memcpy(&tmp, &fuzzer_native_uc.uc_mcontext.fpregs.fprs[i], 8);
+#if 0
+        if (env->vregs[i][0] != tmp || env->vregs[i][1] != fuzzer_native_uc.uc_mcontext_ext.vxrs_low[i]) {
+            printf("tcg v%d 0x%lx:0x%lx != native v%d 0x%lx:0x%lx\n", i, env->vregs[i][0], env->vregs[i][1], i, tmp, fuzzer_native_uc.uc_mcontext_ext.vxrs_low[i]);
+            fail = true;
+        }
+#else
+        /*
+         * POp says:
+         *
+         * Whenever a floating-point instruction or
+         * floating point support instruction writes to a floating
+         * point register, or a floating point instruction that reads
+         * a register pair reads from floating-point registers, bits
+         * 64-127 of the corresponding vector register are
+         * unpredictable.
+         *
+         * For fuzzing single-instruction sequences it's okay to ignore the
+         * respective vector register elements.
+         */
+        if (env->vregs[i][0] != tmp) {
+            printf("tcg v%d 0x%lx:? != native v%d 0x%lx:?\n", i, env->vregs[i][0], i, tmp);
+            fail = true;
+        }
+#endif
+    }
+    for (int i = 0; i < 16; i++) {
+        if (env->vregs[i + 16][0] != fuzzer_native_uc.uc_mcontext_ext.vxrs_high[i].high || env->vregs[i + 16][1] != fuzzer_native_uc.uc_mcontext_ext.vxrs_high[i].low) {
+            printf("tcg v%d 0x%lx:0x%lx != native v%d 0x%llx:0x%llx\n", i + 16, env->vregs[i + 16][0], env->vregs[i + 16][1], i + 16, fuzzer_native_uc.uc_mcontext_ext.vxrs_high[i].high, fuzzer_native_uc.uc_mcontext_ext.vxrs_high[i].low);
+            fail = true;
+        }
+    }
+    for (int i = 0; i < 16; i++) {
+        if (env->aregs[i] != fuzzer_native_uc.uc_mcontext.regs.acrs[i]) {
+            printf("tcg a%d 0x%x != native a%d 0x%x\n", i, env->aregs[i], i, fuzzer_native_uc.uc_mcontext.regs.acrs[i]);
+            fail = true;
+        }
+    }
+    if (env->fpc != fuzzer_native_uc.uc_mcontext.fpregs.fpc) {
+        printf("tcg fpc 0x%x != native fpc 0x%x\n", env->fpc, fuzzer_native_uc.uc_mcontext.fpregs.fpc);
+        fail = true;
+    }
+    {
+        uint64_t tmp = s390_cpu_get_psw_mask(env);
+        if (tmp != fuzzer_native_uc.uc_mcontext.regs.psw.mask) {
+            printf("tcg pswm 0x%lx != native pswm 0x%lx\n", tmp, fuzzer_native_uc.uc_mcontext.regs.psw.mask);
+            fail = true;
+        }
+    }
+    if (env->psw.addr != fuzzer_native_uc.uc_mcontext.regs.psw.addr) {
+        printf("tcg pswa 0x%lx != native pswa 0x%lx\n", env->psw.addr, fuzzer_native_uc.uc_mcontext.regs.psw.addr);
+        fail = true;
+    }
+    if (fuzzer_tcg_sig != fuzzer_native_sig) {
+        printf("tcg signal %d != native signal %d\n", fuzzer_tcg_sig, fuzzer_native_sig);
+        fail = true;
+    }
+    if (fail) {
+        printf("signal %d\n", fuzzer_tcg_sig);
+        abort();
+    }
+
+    return 0;
+}
+
+int LLVMFuzzerRunDriver(int *argc, char ***argv,
+                        int (*UserCb)(const uint8_t *Data, size_t Size));
+
+#endif
+
 int main(int argc, char **argv, char **envp)
 {
     struct image_info info1, *info = &info1;
@@ -696,6 +981,16 @@ int main(int argc, char **argv, char **envp)
     int host_page_size;
     unsigned long max_reserved_va;
     bool preserve_argv0;
+#ifdef CONFIG_TCG_FUZZING
+    char handle_ill[] = "-handle_ill=0";
+    char *fuzzer_argv_buf[] = {argv[0], handle_ill, getenv("CRASH"), NULL};
+    int fuzzer_argc = sizeof(fuzzer_argv_buf) / sizeof(fuzzer_argv_buf[0]) - 1;
+    char **fuzzer_argv = fuzzer_argv_buf;
+
+    if (!fuzzer_argv_buf[2]) {
+        fuzzer_argc--;
+    }
+#endif
 
     error_init(argv[0]);
     module_call_init(MODULE_INIT_TRACE);
@@ -1030,6 +1325,10 @@ int main(int argc, char **argv, char **envp)
 
 #ifdef CONFIG_SEMIHOSTING
     qemu_semihosting_guestfd_init();
+#endif
+
+#ifdef CONFIG_TCG_FUZZING
+    LLVMFuzzerRunDriver(&fuzzer_argc, &fuzzer_argv, LLVMFuzzerTestOneInput);
 #endif
 
     cpu_loop(env);

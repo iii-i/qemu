@@ -3170,6 +3170,10 @@ if spice.found()
     cc.has_function('spice_qxl_gl_scanout2', dependencies: spice))
 endif
 
+if get_option('tcg_fuzzing')
+  config_host_data.set('CONFIG_TCG_FUZZING', '1')
+endif
+
 if host_os == 'windows'
   mingw_has_setjmp_longjmp = cc.links('''
     #include <setjmp.h>
