@@ -508,38 +508,43 @@ bool page_check_range(vaddr start, vaddr len, int flags)
     locked = have_mmap_lock();
     while (true) {
         PageFlagsNode *p = pageflags_find(start, last);
-        int missing;
+        int missing = 0;
+        bool retry = false;
 
+        /*
+         * Lockless lookups can return inconsistent results during a
+         * concurrent pageflags_set_clear: a NULL when the covering node
+         * was just removed mid-split, a non-overlapping neighbour when
+         * the covering node was momentarily out of the tree, or a node
+         * whose flags haven't been updated yet.  Any of these can make
+         * the check look like it failed; retry under the lock before
+         * concluding the access is invalid.
+         */
         if (!p) {
+            retry = true;
+        } else if (start < p->itree.start) {
+            retry = true;
+        } else {
+            missing = flags & ~p->flags;
+            if (missing & ~PAGE_WRITE) {
+                retry = true;
+            } else if ((missing & PAGE_WRITE) &&
+                       !(p->flags & PAGE_WRITE_ORG)) {
+                retry = true;
+            }
+        }
+
+        if (retry) {
             if (!locked) {
-                /*
-                 * Lockless lookups have false negatives.
-                 * Retry with the lock held.
-                 */
                 mmap_lock();
                 locked = -1;
-                p = pageflags_find(start, last);
+                continue;
             }
-            if (!p) {
-                ret = false; /* entire region invalid */
-                break;
-            }
-        }
-        if (start < p->itree.start) {
-            ret = false; /* initial bytes invalid */
+            ret = false;
             break;
         }
 
-        missing = flags & ~p->flags;
-        if (missing & ~PAGE_WRITE) {
-            ret = false; /* page doesn't match */
-            break;
-        }
         if (missing & PAGE_WRITE) {
-            if (!(p->flags & PAGE_WRITE_ORG)) {
-                ret = false; /* page not writable */
-                break;
-            }
             /* Asking about writable, but has been protected: undo. */
             if (!page_unprotect(NULL, start, 0)) {
                 ret = false;

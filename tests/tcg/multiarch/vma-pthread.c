@@ -64,9 +64,10 @@ static void *thread_read(void *arg)
         sret = write(ctx->dev_null_fd, p, 1);
         if (sret != 1) {
             if (sret < 0) {
-                fprintf(stderr, "fail indirect read %p (%m)\n", p);
+                fprintf(stderr, "fail indirect read %p j=%zu base=%p off=%zu (%m)\n",
+                        p, j, ctx->ptr, (size_t)(p - ctx->ptr));
             } else {
-                fprintf(stderr, "fail indirect read %p (%zd)\n", p, sret);
+                fprintf(stderr, "fail indirect read %p j=%zu (%zd)\n", p, j, sret);
             }
             abort();
         }
@@ -93,7 +94,8 @@ static void *thread_write(void *arg)
                                  sizeof(struct timespec));
         ret = clock_gettime(CLOCK_REALTIME, ts);
         if (ret != 0) {
-            fprintf(stderr, "fail indirect write %p (%m)\n", ts);
+            fprintf(stderr, "fail indirect write %p j=%zu base=%p off=%zu (%m)\n",
+                    ts, j, ctx->ptr, (size_t)((char *)ts - ctx->ptr));
             abort();
         }
     }
@@ -154,11 +156,18 @@ static void *thread_mutate(void *arg)
     return NULL;
 }
 
+/* Amplified thread mix to make the VMA race more frequent. */
+#define N_READERS   4
+#define N_WRITERS   4
+#define N_EXECUTORS 2
+#define N_MUTATORS  4
+#define N_THREADS   (N_READERS + N_WRITERS + N_EXECUTORS + N_MUTATORS)
+
 int main(void)
 {
-    pthread_t threads[5];
+    pthread_t threads[N_THREADS];
     struct context ctx;
-    size_t i;
+    size_t i, n;
     int ret;
 
     /* Without a template, nothing to test. */
@@ -177,22 +186,29 @@ int main(void)
     }
     ctx.dev_null_fd = open("/dev/null", O_WRONLY);
     assert(ctx.dev_null_fd >= 0);
-    ctx.mutator_count = 2;
+    ctx.mutator_count = N_MUTATORS;
 
     /* Start threads. */
-    ret = pthread_create(&threads[0], NULL, thread_read, &ctx);
-    assert(ret == 0);
-    ret = pthread_create(&threads[1], NULL, thread_write, &ctx);
-    assert(ret == 0);
-    ret = pthread_create(&threads[2], NULL, thread_execute, &ctx);
-    assert(ret == 0);
-    for (i = 3; i <= 4; i++) {
-        ret = pthread_create(&threads[i], NULL, thread_mutate, &ctx);
+    n = 0;
+    for (i = 0; i < N_READERS; i++) {
+        ret = pthread_create(&threads[n++], NULL, thread_read, &ctx);
+        assert(ret == 0);
+    }
+    for (i = 0; i < N_WRITERS; i++) {
+        ret = pthread_create(&threads[n++], NULL, thread_write, &ctx);
+        assert(ret == 0);
+    }
+    for (i = 0; i < N_EXECUTORS; i++) {
+        ret = pthread_create(&threads[n++], NULL, thread_execute, &ctx);
+        assert(ret == 0);
+    }
+    for (i = 0; i < N_MUTATORS; i++) {
+        ret = pthread_create(&threads[n++], NULL, thread_mutate, &ctx);
         assert(ret == 0);
     }
 
     /* Wait for threads to stop. */
-    for (i = 0; i < sizeof(threads) / sizeof(threads[0]); i++) {
+    for (i = 0; i < N_THREADS; i++) {
         ret = pthread_join(threads[i], NULL);
         assert(ret == 0);
     }
