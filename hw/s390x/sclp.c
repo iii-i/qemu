@@ -15,6 +15,7 @@
 #include "qemu/osdep.h"
 #include "qemu/units.h"
 #include "qemu/main-loop.h"
+#include "qemu/timer.h"
 #include "qapi/error.h"
 #include "hw/core/boards.h"
 #include "system/memory.h"
@@ -75,7 +76,47 @@ static struct {
     bool stop;               /* the harness closed the pipe */
     int in_fd;               /* fuzzer -> QEMU: framed scenarios */
     int out_fd;              /* QEMU -> fuzzer: COV_N-byte coverage vectors */
+    QEMUBH *ev_bh;           /* fast path: one event-pending kick per read */
+    QEMUTimer *ev_wd;        /* watchdog: recovers a lost kick if the loop stalls */
 } fuzz;
+
+/* Watchdog period: how long the read loop may go quiet before we re-kick it. */
+#define SCLP_FUZZ_EV_WATCHDOG_MS 2
+
+/*
+ * Keep the guest issuing Read-Event-Data.
+ *
+ * KVM splits an SCLP service signal into two deliveries: the SCCB *completion*
+ * (with the event-pending bits masked off) and a standalone *event-pending*
+ * notification. Only the latter makes the guest's driver queue another read
+ * (drivers/s390/char/sclp.c gates on evbuf_pending). The event-pending bit is a
+ * single collapsing level, so forcing it on completions is not reliable. So we
+ * inject a dedicated event-pending signal per read from a bottom half (the fast
+ * path), backed by a wall-clock watchdog that re-injects if the loop ever goes
+ * quiet -- the fast path drives throughput, the watchdog guarantees liveness.
+ */
+static void sclp_fuzz_ev_arm(void)
+{
+    if (fuzz.active && !fuzz.stop) {
+        timer_mod(fuzz.ev_wd, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) +
+                              SCLP_FUZZ_EV_WATCHDOG_MS);
+    }
+}
+
+static void sclp_fuzz_ev_kick(void *opaque)
+{
+    if (fuzz.active && !fuzz.stop) {
+        sclp_service_interrupt(0);
+    }
+}
+
+static void sclp_fuzz_ev_watchdog(void *opaque)
+{
+    if (fuzz.active && !fuzz.stop) {
+        sclp_service_interrupt(0);
+        sclp_fuzz_ev_arm();
+    }
+}
 
 /* Blocking pipe I/O from the vCPU thread: drop the BQL so the main loop runs. */
 static bool sclp_fuzz_io(int fd, void *buf, size_t n, bool writing)
@@ -122,6 +163,13 @@ static void sclp_fuzz_control(SCCB *sccb)
         fuzz.out_fd = atoi(out);
         fuzz.active = true;
         fuzz.stop = false;
+        if (!fuzz.ev_bh) {
+            fuzz.ev_bh = qemu_bh_new(sclp_fuzz_ev_kick, NULL);
+            fuzz.ev_wd = timer_new_ms(QEMU_CLOCK_REALTIME,
+                                      sclp_fuzz_ev_watchdog, NULL);
+        }
+        qemu_bh_schedule(fuzz.ev_bh);
+        sclp_fuzz_ev_arm();
     }
     sccb->h.response_code = cpu_to_be16(SCLP_RC_NORMAL_COMPLETION);
 }
@@ -167,6 +215,9 @@ static void sclp_fuzz_mutate(SCCB *work_sccb, uint32_t code, uint16_t cap)
     /* Overlay the attacker-authored bytes onto this read's response. */
     memcpy(work_sccb, input, len > cap ? cap : len);
 
+    /* Ensure the guest issues the next read; push the watchdog out. */
+    qemu_bh_schedule(fuzz.ev_bh);
+    sclp_fuzz_ev_arm();
 }
 
 static inline bool sclp_command_code_valid(uint32_t code)
@@ -519,6 +570,16 @@ static void service_interrupt(SCLPDevice *sclp, uint32_t sccb)
 
     /* Indicate whether an event is still pending */
     param |= efc->event_pending(ef) ? 1 : 0;
+
+    /*
+     * In fuzzer mode, always report an event pending so the guest's SCLP driver
+     * re-arms and issues the next Read-Event-Data from its own interrupt path.
+     * That self-sustaining loop is what lets the host drive every input without
+     * an in-guest agent in the loop (see the shim comment above).
+     */
+    if (fuzz.active && !fuzz.stop) {
+        param |= 1;
+    }
 
     if (!param) {
         /* No need to send an interrupt, there's nothing to be notified about */
