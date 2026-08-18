@@ -14,11 +14,13 @@
 
 #include "qemu/osdep.h"
 #include "qemu/units.h"
+#include "qemu/error-report.h"
 #include "qemu/main-loop.h"
 #include "qemu/timer.h"
 #include "qapi/error.h"
 #include "hw/core/boards.h"
 #include "system/memory.h"
+#include "system/address-spaces.h"
 #include "hw/s390x/sclp.h"
 #include "hw/s390x/event-facility.h"
 #include "hw/s390x/s390-pci-bus.h"
@@ -61,6 +63,14 @@ static SCLPDevice *get_sclp_device(void)
 #define SCLP_FUZZ_CTL_CMD     0x00ff0001 /* reserved: never real SCLP emulation */
 #define SCLP_FUZZ_OP_READY    1          /* enter fuzzer mode, advertise KCOV */
 
+/* Size of the folded 8-bit coverage vector shipped to the harness each input. */
+#define SCLP_FUZZ_COV_N       4000
+/* The guest publishes its KCOV buffer's guest-physical pages so QEMU can read
+ * coverage directly (design S6). Bound the page list (each page is 4K, so this
+ * caps the buffer at 1M / 128K PCs). */
+#define SCLP_FUZZ_COV_MAX_PAGES 256
+#define SCLP_FUZZ_COV_PAGE      4096
+
 /* Control block the guest and QEMU exchange over the reserved command
  * (big-endian on the wire). The guest appends the advertised KCOV page list
  * right after this fixed 32-byte prefix, so the layout must stay in sync with
@@ -74,8 +84,13 @@ typedef struct QEMU_PACKED SclpFuzzCtl {
 static struct {
     bool active;             /* fuzzer mode is on */
     bool stop;               /* the harness closed the pipe */
+    bool have_prev;          /* a previous input's coverage is pending */
     int in_fd;               /* fuzzer -> QEMU: framed scenarios */
     int out_fd;              /* QEMU -> fuzzer: COV_N-byte coverage vectors */
+    /* guest KCOV buffer, advertised once via READY, read directly each input */
+    uint64_t cov_gpa[SCLP_FUZZ_COV_MAX_PAGES];
+    unsigned cov_npages;
+    uint64_t cov_words;
     QEMUBH *ev_bh;           /* fast path: one event-pending kick per read */
     QEMUTimer *ev_wd;        /* watchdog: recovers a lost kick if the loop stalls */
 } fuzz;
@@ -118,6 +133,52 @@ static void sclp_fuzz_ev_watchdog(void *opaque)
     }
 }
 
+/*
+ * Fold this input's guest coverage into an 8-bit vector by reading the guest's
+ * KCOV buffer directly from its published guest-physical pages -- no guest-side
+ * copy, and off the fuzzed SCLP data path (design S6). cover[0] is the number of
+ * PCs; cover[1..] are the PCs. Host and guest are the same (big-endian)
+ * architecture under KVM, so the raw words need no swap.
+ */
+static void sclp_fuzz_read_cov(uint8_t *vec)
+{
+    g_autofree uint64_t *buf = NULL;
+    uint64_t count = 0, w;
+    unsigned pages;
+
+    memset(vec, 0, SCLP_FUZZ_COV_N);
+    if (!fuzz.cov_npages) {
+        return;
+    }
+    address_space_read(&address_space_memory, fuzz.cov_gpa[0],
+                       MEMTXATTRS_UNSPECIFIED, &count, sizeof(count));
+    if (count > fuzz.cov_words - 1) {
+        count = fuzz.cov_words - 1;
+    }
+    pages = ((count + 1) * sizeof(uint64_t) + SCLP_FUZZ_COV_PAGE - 1) /
+            SCLP_FUZZ_COV_PAGE;
+    if (pages > fuzz.cov_npages) {
+        pages = fuzz.cov_npages;
+    }
+    buf = g_malloc(pages * SCLP_FUZZ_COV_PAGE);
+    for (unsigned p = 0; p < pages; p++) {
+        address_space_read(&address_space_memory, fuzz.cov_gpa[p],
+                           MEMTXATTRS_UNSPECIFIED,
+                           (uint8_t *)buf + p * SCLP_FUZZ_COV_PAGE,
+                           SCLP_FUZZ_COV_PAGE);
+    }
+    for (w = 1; w <= count; w++) {
+        uint64_t h = buf[w];
+
+        h ^= h >> 33;
+        h *= 0xff51afd7ed558ccdULL;
+        h ^= h >> 29;
+        if (vec[h % SCLP_FUZZ_COV_N] != 255) {
+            vec[h % SCLP_FUZZ_COV_N]++;
+        }
+    }
+}
+
 /* Blocking pipe I/O from the vCPU thread: drop the BQL so the main loop runs. */
 static bool sclp_fuzz_io(int fd, void *buf, size_t n, bool writing)
 {
@@ -157,12 +218,15 @@ static void sclp_fuzz_control(SCCB *sccb)
 {
     const char *in = getenv("SCLP_FUZZ_IN_FD");
     const char *out = getenv("SCLP_FUZZ_OUT_FD");
+    uint64_t *pub = (uint64_t *)((uint8_t *)sccb + sizeof(SclpFuzzCtl));
+    unsigned i;
 
     if (in && out) {
         fuzz.in_fd = atoi(in);
         fuzz.out_fd = atoi(out);
         fuzz.active = true;
         fuzz.stop = false;
+        fuzz.have_prev = false;
         if (!fuzz.ev_bh) {
             fuzz.ev_bh = qemu_bh_new(sclp_fuzz_ev_kick, NULL);
             fuzz.ev_wd = timer_new_ms(QEMU_CLOCK_REALTIME,
@@ -170,6 +234,17 @@ static void sclp_fuzz_control(SCCB *sccb)
         }
         qemu_bh_schedule(fuzz.ev_bh);
         sclp_fuzz_ev_arm();
+        fuzz.cov_npages = be64_to_cpu(pub[0]);
+        fuzz.cov_words = be64_to_cpu(pub[1]);
+        if (fuzz.cov_npages > SCLP_FUZZ_COV_MAX_PAGES) {
+            fuzz.cov_npages = SCLP_FUZZ_COV_MAX_PAGES;
+        }
+        for (i = 0; i < fuzz.cov_npages; i++) {
+            fuzz.cov_gpa[i] = be64_to_cpu(pub[2 + i]);
+        }
+        info_report("sclp-fuzz: fuzzer mode (in_fd=%d out_fd=%d, "
+                    "kcov %u pages / %" PRIu64 " words)",
+                    fuzz.in_fd, fuzz.out_fd, fuzz.cov_npages, fuzz.cov_words);
     }
     sccb->h.response_code = cpu_to_be16(SCLP_RC_NORMAL_COMPLETION);
 }
@@ -189,7 +264,9 @@ static void sclp_fuzz_control(SCCB *sccb)
  */
 static void sclp_fuzz_mutate(SCCB *work_sccb, uint32_t code, uint16_t cap)
 {
+    uint8_t vec[SCLP_FUZZ_COV_N];
     uint8_t input[SCCB_SIZE];
+    uint64_t zero = 0;
     uint32_t len = 0;
 
     if ((code & SCLP_CMD_CODE_MASK) != SCLP_CMD_READ_EVENT_DATA) {
@@ -197,6 +274,15 @@ static void sclp_fuzz_mutate(SCCB *work_sccb, uint32_t code, uint16_t cap)
     }
     if (!fuzz.active || fuzz.stop) {
         return;
+    }
+
+    /* The previous input's dispatch is done; ship its coverage. */
+    if (fuzz.have_prev) {
+        sclp_fuzz_read_cov(vec);
+        if (!sclp_fuzz_io(fuzz.out_fd, vec, SCLP_FUZZ_COV_N, true)) {
+            fuzz.stop = true;
+            return;
+        }
     }
 
     /* Pull the next input (blocks until the harness sends one). */
@@ -212,8 +298,19 @@ static void sclp_fuzz_mutate(SCCB *work_sccb, uint32_t code, uint16_t cap)
         return;
     }
 
-    /* Overlay the attacker-authored bytes onto this read's response. */
+    /* Reset the guest coverage count, then overlay the input for this read. */
+    address_space_write(&address_space_memory, fuzz.cov_gpa[0],
+                        MEMTXATTRS_UNSPECIFIED, &zero, sizeof(zero));
     memcpy(work_sccb, input, len > cap ? cap : len);
+    /*
+     * Force a "successful read" response code. The guest only walks the event
+     * buffer chain -- the parser we are fuzzing -- when the read completed
+     * normally (sclp_read_cb() checks for 0x20/0x220); a malformed response code
+     * would just be dropped. The malice lives in the evbuf chain, which stays
+     * fully attacker-controlled, so pin the response code and fuzz the rest.
+     */
+    work_sccb->h.response_code = cpu_to_be16(SCLP_RC_NORMAL_COMPLETION);
+    fuzz.have_prev = true;
 
     /* Ensure the guest issues the next read; push the watchdog out. */
     qemu_bh_schedule(fuzz.ev_bh);
