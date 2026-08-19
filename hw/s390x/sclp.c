@@ -44,9 +44,10 @@ static SCLPDevice *get_sclp_device(void)
  * A real malicious hypervisor authors the SCCB bytes the guest parses, and is
  * not bound by the guest-protection checks sclp_service_call() performs. In
  * fuzzer mode QEMU overlays attacker-authored bytes onto the private work_sccb
- * of every Read-Event-Data *after* real emulation and *after* QEMU's own
- * boundary checks -- precisely the hostile, invariant-violating response a
- * fuzzer needs to deliver to test the guest's own validation.
+ * of every targeted command (see sclp_fuzz_target_cmd()) *after* real emulation
+ * and *after* QEMU's own boundary checks -- precisely the hostile,
+ * invariant-violating response a fuzzer needs to deliver to test the guest's
+ * own validation.
  *
  * The whole loop is driven from the host: QEMU keeps event-pending set (see
  * service_interrupt()), so the guest's SCLP driver keeps issuing reads from its
@@ -250,15 +251,40 @@ static void sclp_fuzz_control(SCCB *sccb)
 }
 
 /*
- * Host-driven event injection + coverage read, done at each Read-Event-Data.
+ * Commands whose host-authored response we overlay. Read-Event-Data is the
+ * async event path; the read-info commands are guest-initiated request/response
+ * whose responses are fixed structs the guest walks by host-controlled
+ * counts/offsets (e.g. sclp_fill_core_info()'s memcpy off ->offset_configured).
+ * A fuzzed event can itself provoke one of these (an EVTYP_CONFMGMDATA event ->
+ * sclp_conf_receiver_fn -> smp_rescan_cpus -> Read-CPU-Info), so overlaying them
+ * too lets that whole chain be driven hostile, steered by coverage. The write
+ * commands (console, event-mask handshake) are deliberately left honest so the
+ * SCLP control plane keeps working.
+ */
+static bool sclp_fuzz_target_cmd(uint32_t code)
+{
+    switch (code & SCLP_CMD_CODE_MASK) {
+    case SCLP_CMD_READ_EVENT_DATA:
+    case SCLP_CMDW_READ_CPU_INFO:
+    case SCLP_CMDW_READ_SCP_INFO:
+    case SCLP_CMDW_READ_SCP_INFO_FORCED:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/*
+ * Host-driven event/response injection + coverage read, done at each targeted
+ * command.
  *
  * In fuzzer mode QEMU keeps event-pending set (service_interrupt()), so the
  * guest's own SCLP driver loops "dispatch previous event, then read the next
  * one" entirely in its interrupt path -- the same code an untrusted hypervisor
- * would drive. Each read is therefore issued only *after* the previous input's
- * dispatch finished, which is exactly the rendezvous we need: read+ship that
- * input's coverage, pull the next input from the harness, reset the guest's
- * coverage counter, and overlay the input onto this read's response.
+ * would drive. Each targeted command is therefore issued only *after* the
+ * previous input's dispatch finished, which is exactly the rendezvous we need:
+ * read+ship that input's coverage, pull the next input from the harness, reset
+ * the guest's coverage counter, and overlay the input onto this response.
  *
  * No in-guest replay knob, no marker, no per-event agent involvement.
  */
@@ -269,7 +295,7 @@ static void sclp_fuzz_mutate(SCCB *work_sccb, uint32_t code, uint16_t cap)
     uint64_t zero = 0;
     uint32_t len = 0;
 
-    if ((code & SCLP_CMD_CODE_MASK) != SCLP_CMD_READ_EVENT_DATA) {
+    if (!sclp_fuzz_target_cmd(code)) {
         return;
     }
     if (!fuzz.active || fuzz.stop) {
@@ -303,13 +329,15 @@ static void sclp_fuzz_mutate(SCCB *work_sccb, uint32_t code, uint16_t cap)
                         MEMTXATTRS_UNSPECIFIED, &zero, sizeof(zero));
     memcpy(work_sccb, input, len > cap ? cap : len);
     /*
-     * Force a "successful read" response code. The guest only walks the event
-     * buffer chain -- the parser we are fuzzing -- when the read completed
-     * normally (sclp_read_cb() checks for 0x20/0x220); a malformed response code
-     * would just be dropped. The malice lives in the evbuf chain, which stays
-     * fully attacker-controlled, so pin the response code and fuzz the rest.
+     * Force a "successful" response code so the guest actually parses our bytes
+     * rather than dropping them: Read-Event-Data completion is 0x0020, the
+     * read-info commands report 0x0010. The payload the guest then walks (the
+     * evbuf chain, or the read-info struct's counts/offsets) stays fully
+     * attacker-controlled -- that is what we fuzz.
      */
-    work_sccb->h.response_code = cpu_to_be16(SCLP_RC_NORMAL_COMPLETION);
+    work_sccb->h.response_code = cpu_to_be16(
+        (code & SCLP_CMD_CODE_MASK) == SCLP_CMD_READ_EVENT_DATA ?
+        SCLP_RC_NORMAL_COMPLETION : SCLP_RC_NORMAL_READ_COMPLETION);
     fuzz.have_prev = true;
 
     /* Ensure the guest issues the next read; push the watchdog out. */
