@@ -18,6 +18,9 @@ s390x_ss.add(files(
   'sclpquiesce.c',
   'tod.c',
 ))
+if get_option('sclp_fuzz')
+  s390x_ss.add(files('sclp-fuzz.c'))
+endif
 s390x_ss.add(when: 'CONFIG_KVM', if_true: files(
   'tod-kvm.c',
   's390-skeys-kvm.c',

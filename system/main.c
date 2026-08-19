@@ -28,6 +28,10 @@
 #include "system/replay.h"
 #include "system/system.h"
 
+#ifdef CONFIG_SCLP_FUZZ
+#include "hw/s390x/sclp-fuzz.h"
+#endif
+
 #ifdef CONFIG_SDL
 /*
  * SDL insists on wrapping the main() function with its own implementation on
@@ -83,6 +87,14 @@ int main(int argc, char **argv)
      */
     bql_unlock();
     replay_mutex_unlock();
+
+#ifdef CONFIG_SCLP_FUZZ
+    /* With a corpus set, hand this thread to the in-process libFuzzer driver
+     * instead of the normal main loop; it never returns (hw/s390x/sclp-fuzz.c). */
+    if (getenv("SCLP_FUZZ_CORPUS")) {
+        return sclp_fuzz_run();
+    }
+#endif
 
     if (qemu_main) {
         QemuThread main_loop_thread;

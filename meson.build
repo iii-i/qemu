@@ -825,6 +825,30 @@ coref = []
 iokit = []
 pvg = not_found
 emulator_link_args = []
+
+# In-process SCLP fuzzing: link libFuzzer's runtime-without-main into the
+# ordinary emulator (design S3). The tree stays gcc and uninstrumented -- clang
+# is asked only to locate its self-contained archive; the guest's KCOV is the
+# coverage signal. The runtime is C++, hence -lstdc++.
+if get_option('sclp_fuzz')
+  clang = find_program('clang-22', 'clang', required: true)
+  # The archive is named either plainly or with a per-target suffix
+  # (libclang_rt.fuzzer_no_main-s390x.a); --print-file-name echoes the query
+  # unchanged when it cannot resolve it, so try the suffixed name first.
+  fuzzer_rt = ''
+  foreach name : ['libclang_rt.fuzzer_no_main-' + host_machine.cpu_family() + '.a',
+                  'libclang_rt.fuzzer_no_main.a']
+    path = run_command(clang, '--print-file-name=' + name,
+                       check: true).stdout().strip()
+    if fuzzer_rt == '' and path.startswith('/')
+      fuzzer_rt = path
+    endif
+  endforeach
+  if fuzzer_rt == ''
+    error('sclp_fuzz: cannot locate libclang_rt.fuzzer_no_main via ' + clang.full_path())
+  endif
+  emulator_link_args += [fuzzer_rt, '-lstdc++']
+endif
 midl = not_found
 widl = not_found
 pathcch = not_found
@@ -2433,6 +2457,7 @@ config_host_data.set('CONFIG_COCOA', cocoa.found())
 config_host_data.set('CONFIG_DARWIN', host_os == 'darwin')
 config_host_data.set('CONFIG_FDT', fdt.found())
 config_host_data.set('CONFIG_FUZZ', get_option('fuzzing'))
+config_host_data.set('CONFIG_SCLP_FUZZ', get_option('sclp_fuzz'))
 config_host_data.set('CONFIG_GCOV', get_option('b_coverage'))
 config_host_data.set('CONFIG_LIBUDEV', libudev.found())
 config_host_data.set('CONFIG_LINUX', host_os == 'linux')
