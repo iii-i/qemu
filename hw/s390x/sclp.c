@@ -14,18 +14,24 @@
 
 #include "qemu/osdep.h"
 #include "qemu/units.h"
+#include "qemu/error-report.h"
 #include "qemu/main-loop.h"
+#include "qemu/thread.h"
 #include "qemu/timer.h"
 #include "qapi/error.h"
 #include "hw/core/boards.h"
 #include "system/memory.h"
+#include "system/address-spaces.h"
+#include "system/runstate.h"
+#include "system/cpus.h"
 #include "hw/s390x/sclp.h"
+#include "hw/s390x/sclp-fuzz.h"
+#include "hw/virtio/virtio-kcov.h"
 #include "hw/s390x/event-facility.h"
 #include "hw/s390x/s390-pci-bus.h"
 #include "hw/s390x/ipl.h"
 #include "hw/s390x/cpu-topology.h"
 #include "hw/s390x/s390-virtio-ccw.h"
-#include "hw/virtio/virtio-kcov.h"
 
 static SCLPDevice *get_sclp_device(void)
 {
@@ -51,15 +57,23 @@ static SCLPDevice *get_sclp_device(void)
  * The whole loop is driven from the host: QEMU keeps event-pending set (see
  * service_interrupt()), so the guest's SCLP driver keeps issuing reads from its
  * own interrupt path -- exactly what an untrusted hypervisor would provoke. No
- * in-guest replay knob and no per-event agent involvement; the in-kernel
- * virtio-kcov device owns and advertises the coverage buffer. Each read is
- * issued only after the previous input's dispatch finished, giving a free
- * per-input rendezvous.
+ * in-guest replay knob and no per-event agent involvement. Each read is issued
+ * only after the previous input's dispatch finished, giving a free per-input
+ * rendezvous.
+ *
+ * The guest's KCOV coverage buffer is advertised generically via the virtio-kcov
+ * device (hw/virtio/virtio-kcov.c), which maps its pages for translation-free
+ * reads and calls sclp_fuzz_on_advertise() to (re)arm fuzzer mode -- so this
+ * shim carries no s390-specific coverage-buffer handshake.
  *
  * The overlay bytes are a raw SCCB image (a 2-byte big-endian length, the rest
  * of the header, then a chain of event buffers whose declared lengths are
  * deliberately independent of their real size -- over-read / short-read /
- * chain-walk shapes), pulled from the harness over a pipe.
+ * chain-walk shapes). Two transports feed them in: an external libFuzzer harness
+ * over two pipes (fds in the environment), or an in-process libFuzzer driver
+ * linked into QEMU itself (hw/s390x/sclp-fuzz.c), which pre-arms the shim and
+ * rendezvouses over a condvar instead. Only the transport differs; the vCPU-side
+ * loop below is identical for both.
  */
 
 /* Size of the folded 8-bit coverage vector shipped to the harness each input. */
@@ -67,12 +81,21 @@ static SCLPDevice *get_sclp_device(void)
 
 static struct {
     bool active;             /* fuzzer mode is on */
-    bool stop;               /* the harness closed the pipe */
+    bool stop;               /* transport gone (pipe closed) or vCPU unpark */
     bool have_prev;          /* a previous input's coverage is pending */
+    bool inproc;             /* in-process driver transport (vs. pipes) */
     int in_fd;               /* fuzzer -> QEMU: framed scenarios */
     int out_fd;              /* QEMU -> fuzzer: COV_N-byte coverage vectors */
     QEMUBH *ev_bh;           /* fast path: one event-pending kick per read */
     QEMUTimer *ev_wd;        /* watchdog: recovers a lost kick if the loop stalls */
+    /* in-process rendezvous with the driver's main-loop thread */
+    uint8_t *counters;       /* driver's libFuzzer vector; coverage folds here */
+    QemuMutex rz_lock;
+    QemuCond in_cond;        /* driver publishes an input -> wake vCPU */
+    bool in_ready;           /* an unconsumed input sits in slot[] */
+    bool cov_ready;          /* the published input's coverage is folded */
+    uint8_t slot[SCCB_SIZE]; /* the input the driver published */
+    uint32_t slot_len;
 } fuzz;
 
 /* Watchdog period: how long the read loop may go quiet before we re-kick it. */
@@ -193,20 +216,136 @@ static bool sclp_fuzz_io(int fd, void *buf, size_t n, bool writing)
 }
 
 /*
- * virtio-kcov advertised the guest coverage buffer: (re)enter fuzzer mode. The
- * external harness passes the input/coverage pipe fds via the environment. The
- * host then drives the guest's own SCLP read loop (see service_interrupt()).
+ * In-process transport (hw/s390x/sclp-fuzz.c). The driver's main-loop thread
+ * publishes an input into slot[] and then pumps main_loop_wait until cov_ready;
+ * the vCPU thread folds coverage straight into the driver's counter vector, sets
+ * cov_ready, and waits on in_cond for the next input. The vCPU never holds the
+ * BQL across that wait, so the driver's main_loop_wait can always take it
+ * (design S5, S8).
+ */
+void sclp_fuzz_arm_inprocess(uint8_t *counters)
+{
+    fuzz.inproc = true;
+    fuzz.counters = counters;
+    qemu_mutex_init(&fuzz.rz_lock);
+    qemu_cond_init(&fuzz.in_cond);
+}
+
+void sclp_fuzz_publish_input(const uint8_t *data, size_t size)
+{
+    qemu_mutex_lock(&fuzz.rz_lock);
+    fuzz.slot_len = size > SCCB_SIZE ? SCCB_SIZE : size;
+    memcpy(fuzz.slot, data, fuzz.slot_len);
+    fuzz.in_ready = true;
+    fuzz.cov_ready = false;
+    qemu_cond_signal(&fuzz.in_cond);
+    qemu_mutex_unlock(&fuzz.rz_lock);
+}
+
+bool sclp_fuzz_cov_ready(void)
+{
+    bool ready;
+
+    qemu_mutex_lock(&fuzz.rz_lock);
+    ready = fuzz.cov_ready;
+    qemu_mutex_unlock(&fuzz.rz_lock);
+    return ready;
+}
+
+void sclp_fuzz_request_reboot(void)
+{
+    /* Wake the vCPU if it is parked for an input, so the reset can pause it. */
+    qemu_mutex_lock(&fuzz.rz_lock);
+    fuzz.stop = true;
+    qemu_cond_signal(&fuzz.in_cond);
+    qemu_mutex_unlock(&fuzz.rz_lock);
+    /*
+     * Re-IPL the guest synchronously. The in-process driver pumps
+     * main_loop_wait() directly and never runs the qemu_main_loop() body that
+     * services a queued reset, so qemu_system_reset_request() would be dropped
+     * and the guest would never come back. Do what that body does -- quiesce the
+     * vCPUs, reset (which on s390 reloads the kernel from the IPL CPU, but only
+     * with the CPUs paused), then resume -- from the main thread with the BQL
+     * held, where it belongs.
+     */
+    pause_all_vcpus();
+    qemu_system_reset(SHUTDOWN_CAUSE_HOST_QMP_SYSTEM_RESET);
+    resume_all_vcpus();
+}
+
+/* Ship the just-folded input's coverage to the transport. false: transport gone. */
+static bool sclp_fuzz_ship_cov(void)
+{
+    uint8_t vec[SCLP_FUZZ_COV_N];
+
+    if (fuzz.inproc) {
+        sclp_fuzz_read_cov(fuzz.counters);
+        qemu_mutex_lock(&fuzz.rz_lock);
+        fuzz.cov_ready = true;
+        qemu_mutex_unlock(&fuzz.rz_lock);
+        return true;
+    }
+    sclp_fuzz_read_cov(vec);
+    return sclp_fuzz_io(fuzz.out_fd, vec, SCLP_FUZZ_COV_N, true);
+}
+
+/* Pull the next input, blocking until it arrives. false: transport gone/stop. */
+static bool sclp_fuzz_pull(uint8_t *buf, uint32_t *len)
+{
+    if (fuzz.inproc) {
+        bool held = bql_locked();
+
+        if (held) {
+            bql_unlock();
+        }
+        qemu_mutex_lock(&fuzz.rz_lock);
+        while (!fuzz.in_ready && !fuzz.stop) {
+            qemu_cond_wait(&fuzz.in_cond, &fuzz.rz_lock);
+        }
+        if (fuzz.in_ready) {
+            *len = fuzz.slot_len;
+            memcpy(buf, fuzz.slot, *len);
+            fuzz.in_ready = false;
+        }
+        qemu_mutex_unlock(&fuzz.rz_lock);
+        if (held) {
+            bql_lock();
+        }
+        return !fuzz.stop;
+    }
+    if (!sclp_fuzz_io(fuzz.in_fd, len, sizeof(*len), false)) {
+        return false;
+    }
+    if (*len > SCCB_SIZE) {
+        *len = SCCB_SIZE;
+    }
+    return !*len || sclp_fuzz_io(fuzz.in_fd, buf, *len, false);
+}
+
+/*
+ * virtio-kcov advertised the guest coverage buffer: (re)arm fuzzer mode. The
+ * in-process driver pre-armed the shim (sclp_fuzz_arm_inprocess), or the
+ * external harness passed pipe fds via the environment. The event-pending kick
+ * (with the bit forced on, see service_interrupt()) then drives the read loop.
+ *
+ * Advertise is repeatable: after a guest death the in-process driver re-IPLs it,
+ * the virtio-kcov driver re-probes and re-advertises with the new boot's KCOV
+ * pages, and this re-arms the loop. The rendezvous slot is deliberately left
+ * untouched, so an input the driver published across the reboot survives to the
+ * first read (design S6).
  */
 static void sclp_fuzz_on_advertise(void *opaque)
 {
     const char *in = getenv("SCLP_FUZZ_IN_FD");
     const char *out = getenv("SCLP_FUZZ_OUT_FD");
 
-    if (!(in && out)) {
+    if (!fuzz.inproc && in && out) {
+        fuzz.in_fd = atoi(in);
+        fuzz.out_fd = atoi(out);
+    }
+    if (!fuzz.inproc && !(in && out)) {
         return; /* no transport to drive */
     }
-    fuzz.in_fd = atoi(in);
-    fuzz.out_fd = atoi(out);
     fuzz.active = true;
     fuzz.stop = false;
     fuzz.have_prev = false;
@@ -217,12 +356,15 @@ static void sclp_fuzz_on_advertise(void *opaque)
     }
     qemu_bh_schedule(fuzz.ev_bh);
     sclp_fuzz_ev_arm();
+    info_report("sclp-fuzz: fuzzer mode (%s) armed by virtio-kcov",
+                fuzz.inproc ? "in-process" : "pipe");
 }
 
 /* virtio-kcov reset (guest reboot): disarm until the next advertise. */
 static void sclp_fuzz_on_reset(void *opaque)
 {
     fuzz.active = false;
+    fuzz.have_prev = false;
 }
 
 /*
@@ -265,7 +407,6 @@ static bool sclp_fuzz_target_cmd(uint32_t code)
  */
 static void sclp_fuzz_mutate(SCCB *work_sccb, uint32_t code, uint16_t cap)
 {
-    uint8_t vec[SCLP_FUZZ_COV_N];
     uint8_t input[SCCB_SIZE];
     uint32_t len = 0;
 
@@ -277,23 +418,13 @@ static void sclp_fuzz_mutate(SCCB *work_sccb, uint32_t code, uint16_t cap)
     }
 
     /* The previous input's dispatch is done; ship its coverage. */
-    if (fuzz.have_prev) {
-        sclp_fuzz_read_cov(vec);
-        if (!sclp_fuzz_io(fuzz.out_fd, vec, SCLP_FUZZ_COV_N, true)) {
-            fuzz.stop = true;
-            return;
-        }
-    }
-
-    /* Pull the next input (blocks until the harness sends one). */
-    if (!sclp_fuzz_io(fuzz.in_fd, &len, sizeof(len), false)) {
-        fuzz.stop = true; /* harness closed the pipe */
+    if (fuzz.have_prev && !sclp_fuzz_ship_cov()) {
+        fuzz.stop = true;
         return;
     }
-    if (len > SCCB_SIZE) {
-        len = SCCB_SIZE;
-    }
-    if (len && !sclp_fuzz_io(fuzz.in_fd, input, len, false)) {
+
+    /* Pull the next input (blocks until the transport delivers one). */
+    if (!sclp_fuzz_pull(input, &len)) {
         fuzz.stop = true;
         return;
     }
@@ -698,7 +829,7 @@ static void sclp_realize(DeviceState *dev, Error **errp)
         return;
     }
 
-    /* Arm/disarm fuzzer mode off the virtio-kcov coverage advertise. */
+    /* Arm/disarm fuzzer mode when the guest (re-)advertises its KCOV buffer. */
     virtio_kcov_set_consumer(sclp_fuzz_on_advertise, sclp_fuzz_on_reset, NULL);
 }
 
