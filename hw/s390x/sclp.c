@@ -14,6 +14,7 @@
 
 #include "qemu/osdep.h"
 #include "qemu/units.h"
+#include "qemu/main-loop.h"
 #include "qapi/error.h"
 #include "hw/core/boards.h"
 #include "system/memory.h"
@@ -23,6 +24,7 @@
 #include "hw/s390x/ipl.h"
 #include "hw/s390x/cpu-topology.h"
 #include "hw/s390x/s390-virtio-ccw.h"
+#include "hw/virtio/virtio-kcov.h"
 
 static SCLPDevice *get_sclp_device(void)
 {
@@ -32,6 +34,131 @@ static SCLPDevice *get_sclp_device(void)
         sclp = S390_CCW_MACHINE(qdev_get_machine())->sclp;
     }
     return sclp;
+}
+
+/*
+ * Host-driven mutation shim (Secure-Execution threat-model fuzzing scaffold).
+ *
+ * A real malicious hypervisor authors the SCCB bytes the guest parses, and is
+ * not bound by the guest-protection checks sclp_service_call() performs. In
+ * fuzzer mode QEMU overlays attacker-authored bytes onto the private work_sccb
+ * of every Read-Event-Data *after* real emulation and *after* QEMU's own
+ * boundary checks -- precisely the hostile, invariant-violating response a
+ * fuzzer needs to deliver to test the guest's own validation.
+ *
+ * The whole loop is driven from the host: QEMU keeps event-pending set (see
+ * service_interrupt()), so the guest's SCLP driver keeps issuing reads from its
+ * own interrupt path -- exactly what an untrusted hypervisor would provoke. No
+ * in-guest replay knob and no per-event agent involvement; the in-kernel
+ * virtio-kcov device owns and advertises the coverage buffer. Each read is
+ * issued only after the previous input's dispatch finished, giving a free
+ * per-input rendezvous.
+ *
+ * The overlay bytes are a raw SCCB image (a 2-byte big-endian length, the rest
+ * of the header, then a chain of event buffers whose declared lengths are
+ * deliberately independent of their real size -- over-read / short-read /
+ * chain-walk shapes), pulled from the harness over a pipe.
+ */
+static struct {
+    bool active;             /* fuzzer mode is on */
+    bool stop;               /* the harness closed the pipe */
+    int in_fd;               /* fuzzer -> QEMU: framed scenarios */
+    int out_fd;              /* QEMU -> fuzzer: COV_N-byte coverage vectors */
+} fuzz;
+
+/* Blocking pipe I/O from the vCPU thread: drop the BQL so the main loop runs. */
+static bool sclp_fuzz_io(int fd, void *buf, size_t n, bool writing)
+{
+    uint8_t *p = buf;
+    size_t off = 0;
+    bool held = bql_locked();
+
+    if (held) {
+        bql_unlock();
+    }
+    while (off < n) {
+        ssize_t r = writing ? write(fd, p + off, n - off)
+                            : read(fd, p + off, n - off);
+        if (r < 0 && errno == EINTR) {
+            continue;
+        }
+        if (r <= 0) {
+            break;
+        }
+        off += r;
+    }
+    if (held) {
+        bql_lock();
+    }
+    return off == n;
+}
+
+/*
+ * virtio-kcov advertised the guest coverage buffer: (re)enter fuzzer mode. The
+ * external harness passes the input/coverage pipe fds via the environment. The
+ * host then drives the guest's own SCLP read loop (see service_interrupt()).
+ */
+static void sclp_fuzz_on_advertise(void *opaque)
+{
+    const char *in = getenv("SCLP_FUZZ_IN_FD");
+    const char *out = getenv("SCLP_FUZZ_OUT_FD");
+
+    if (!(in && out)) {
+        return; /* no transport to drive */
+    }
+    fuzz.in_fd = atoi(in);
+    fuzz.out_fd = atoi(out);
+    fuzz.active = true;
+    fuzz.stop = false;
+}
+
+/* virtio-kcov reset (guest reboot): disarm until the next advertise. */
+static void sclp_fuzz_on_reset(void *opaque)
+{
+    fuzz.active = false;
+}
+
+/*
+ * Host-driven event injection + coverage read, done at each Read-Event-Data.
+ *
+ * In fuzzer mode QEMU keeps event-pending set (service_interrupt()), so the
+ * guest's own SCLP driver loops "dispatch previous event, then read the next
+ * one" entirely in its interrupt path -- the same code an untrusted hypervisor
+ * would drive. Each read is therefore issued only *after* the previous input's
+ * dispatch finished, which is exactly the rendezvous we need: read+ship that
+ * input's coverage, pull the next input from the harness, reset the guest's
+ * coverage counter, and overlay the input onto this read's response.
+ *
+ * No in-guest replay knob, no marker, no per-event agent involvement.
+ */
+static void sclp_fuzz_mutate(SCCB *work_sccb, uint32_t code, uint16_t cap)
+{
+    uint8_t input[SCCB_SIZE];
+    uint32_t len = 0;
+
+    if ((code & SCLP_CMD_CODE_MASK) != SCLP_CMD_READ_EVENT_DATA) {
+        return;
+    }
+    if (!fuzz.active || fuzz.stop) {
+        return;
+    }
+
+    /* Pull the next input (blocks until the harness sends one). */
+    if (!sclp_fuzz_io(fuzz.in_fd, &len, sizeof(len), false)) {
+        fuzz.stop = true; /* harness closed the pipe */
+        return;
+    }
+    if (len > SCCB_SIZE) {
+        len = SCCB_SIZE;
+    }
+    if (len && !sclp_fuzz_io(fuzz.in_fd, input, len, false)) {
+        fuzz.stop = true;
+        return;
+    }
+
+    /* Overlay the attacker-authored bytes onto this read's response. */
+    memcpy(work_sccb, input, len > cap ? cap : len);
+
 }
 
 static inline bool sclp_command_code_valid(uint32_t code)
@@ -286,6 +413,7 @@ int sclp_service_call_protected(S390CPU *cpu, uint64_t sccb, uint32_t code)
 
     sclp_c->execute(sclp, work_sccb, code);
 out_write:
+    sclp_fuzz_mutate(work_sccb, code, be16_to_cpu(header.length));
     s390_cpu_pv_mem_write(env_archcpu(env), 0, work_sccb,
                           be16_to_cpu(work_sccb->h.length));
     sclp_c->service_interrupt(sclp, SCLP_PV_DUMMY_ADDR);
@@ -352,6 +480,7 @@ int sclp_service_call(S390CPU *cpu, uint64_t sccb, uint32_t code)
 
     sclp_c->execute(sclp, work_sccb, code);
 out_write:
+    sclp_fuzz_mutate(work_sccb, code, be16_to_cpu(header.length));
     ret = address_space_write(as, sccb, attrs,
                               work_sccb, be16_to_cpu(header.length));
     if (ret != MEMTX_OK) {
@@ -401,6 +530,9 @@ static void sclp_realize(DeviceState *dev, Error **errp)
     if (!sysbus_realize(SYS_BUS_DEVICE(sclp->event_facility), errp)) {
         return;
     }
+
+    /* Arm/disarm fuzzer mode off the virtio-kcov coverage advertise. */
+    virtio_kcov_set_consumer(sclp_fuzz_on_advertise, sclp_fuzz_on_reset, NULL);
 }
 
 static void sclp_init(Object *obj)
